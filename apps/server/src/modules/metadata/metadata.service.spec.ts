@@ -690,10 +690,12 @@ describe('MetadataService', () => {
     expect(logger.warn).toHaveBeenCalledWith(expect.stringContaining('(2099)'));
   });
 
-  // Stale direct IDs must still be corrected to the provider's canonical
-  // ID when the provider's returned externalIds expose a different value
-  // for that same provider (e.g. a merged/redirected TMDB entry).
-  it('corrects a stale direct id when the provider returns a different canonical id', async () => {
+  // When the provider's returned externalIds expose a different value for
+  // that same provider (e.g. a merged/redirected TMDB entry, or — per #3010 —
+  // simply wrong external_ids editor data), the media-server id is kept as
+  // the primary and the canonical id is recorded as an alternate. Downstream
+  // lookups try the primary first and fall back to the alternate.
+  it('records a disagreeing canonical id as a fallback alternate (keeps the media-server primary)', async () => {
     const libraryItem = createMediaItem({
       id: 'movie-stale-id',
       type: 'movie',
@@ -712,12 +714,222 @@ describe('MetadataService', () => {
 
     const result = await service.resolveIdsFromMediaItem(libraryItem);
 
-    expect(result).toMatchObject({ tmdb: 222, type: 'movie' });
+    // Primary remains the media-server's id.
+    expect(result).toMatchObject({ tmdb: 111, type: 'movie' });
     expect(logger.warn).toHaveBeenCalledWith(
       expect.stringContaining(
-        'Corrected TMDB ID for "Fixture Harbor": 111 to 222',
+        'TMDB cross-reference reports TMDB ID for "Fixture Harbor" as 222',
       ),
     );
+    expect(logger.warn).toHaveBeenCalledWith(
+      expect.stringContaining('Keeping 111 and trying 222 as a fallback'),
+    );
+
+    // Downstream candidate ordering: primary first, alternate second.
+    const candidates = await service.resolveLookupCandidatesFromMediaItem(
+      libraryItem,
+      { providerKeys: ['tmdb'] },
+    );
+    expect(candidates).toEqual([
+      { providerKey: 'tmdb', id: 111 },
+      { providerKey: 'tmdb', id: 222 },
+    ]);
+  });
+
+  it('records simultaneous disagreements from multiple providers as parallel alternates', async () => {
+    const libraryItem = createMediaItem({
+      id: 'movie-multi-disagree',
+      type: 'movie',
+      year: 2099,
+      title: 'Fixture Multi',
+      providerIds: { tmdb: ['111'], tvdb: ['333'], imdb: [] },
+    });
+    const { service } = createService({
+      tmdbDetails: {
+        title: 'Fixture Multi',
+        year: 2099,
+        type: 'movie',
+        externalIds: { tmdb: 222, tvdb: 444, type: 'movie' },
+      },
+    });
+
+    const candidates = await service.resolveLookupCandidatesFromMediaItem(
+      libraryItem,
+      { providerKeys: ['tmdb', 'tvdb'] },
+    );
+
+    // Each provider emits primary-then-alternate; ordering follows the policy.
+    expect(candidates).toEqual([
+      { providerKey: 'tmdb', id: 111 },
+      { providerKey: 'tmdb', id: 222 },
+      { providerKey: 'tvdb', id: 333 },
+      { providerKey: 'tvdb', id: 444 },
+    ]);
+  });
+
+  it('only warns once when the same disagreement is reported repeatedly on the same ids object', async () => {
+    const libraryItem = createMediaItem({
+      id: 'movie-dup-warn',
+      type: 'movie',
+      year: 2099,
+      title: 'Fixture Dup',
+      providerIds: { tmdb: ['111'], imdb: [], tvdb: [] },
+    });
+    const { service, logger } = createService({
+      tmdbDetails: {
+        title: 'Fixture Dup',
+        year: 2099,
+        type: 'movie',
+        externalIds: { tmdb: 222, type: 'movie' },
+      },
+    });
+
+    await service.resolveLookupCandidatesFromMediaItem(libraryItem, {
+      providerKeys: ['tmdb'],
+    });
+
+    // resolveIds + buildCandidates flow visits applyIdCorrections more than
+    // once for the same ids object; the dedup guard ensures only one warn.
+    const driftWarns = (logger.warn as jest.Mock).mock.calls.filter((c) =>
+      String(c[0]).includes('cross-reference reports TMDB ID'),
+    );
+    expect(driftWarns).toHaveLength(1);
+  });
+
+  it('does not leak the alternate into the primary slot via fillMissingIds', async () => {
+    const libraryItem = createMediaItem({
+      id: 'movie-no-leak',
+      type: 'movie',
+      year: 2099,
+      title: 'Fixture NoLeak',
+      providerIds: { tmdb: ['111'], imdb: [], tvdb: [] },
+    });
+    const { service } = createService({
+      tmdbDetails: {
+        title: 'Fixture NoLeak',
+        year: 2099,
+        type: 'movie',
+        // TMDB reports a different tmdb (alternate) AND fills tvdb.
+        externalIds: { tmdb: 222, tvdb: 999, type: 'movie' },
+      },
+    });
+
+    const result = await service.resolveIdsFromMediaItem(libraryItem);
+
+    // Primary tmdb is the media-server's 111, not the alternate 222.
+    expect(result?.tmdb).toBe(111);
+    // fillMissingIds DID fill the empty tvdb slot from externalIds.
+    expect(result?.tvdb).toBe(999);
+  });
+
+  it("does NOT dedup across providers when an alternate happens to numerically match another provider's primary", async () => {
+    // tvdb primary 280331 and a (hypothetical) tmdb alternate also 280331 are
+    // distinct entries — buildLookupCandidates dedups per provider key.
+    const libraryItem = createMediaItem({
+      id: 'movie-cross-collide',
+      type: 'movie',
+      year: 2099,
+      title: 'Fixture Collide',
+      providerIds: { tmdb: ['111'], tvdb: ['280331'], imdb: [] },
+    });
+    const { service } = createService({
+      tmdbDetails: {
+        title: 'Fixture Collide',
+        year: 2099,
+        type: 'movie',
+        externalIds: { tmdb: 280331, type: 'movie' },
+      },
+    });
+
+    const candidates = await service.resolveLookupCandidatesFromMediaItem(
+      libraryItem,
+      { providerKeys: ['tmdb', 'tvdb'] },
+    );
+
+    expect(candidates).toEqual([
+      { providerKey: 'tmdb', id: 111 },
+      { providerKey: 'tmdb', id: 280331 },
+      { providerKey: 'tvdb', id: 280331 },
+    ]);
+  });
+
+  it('emits primary-then-alternate via the mediaServerId entrypoint (action-handler path)', async () => {
+    // resolveLookupCandidatesForService is used by sonarr/radarr action
+    // handlers; the From-MediaItem variant is used by getters. Both paths
+    // must surface alternates equally.
+    const mediaServer = {
+      getMetadata: jest.fn(),
+    };
+    mediaServer.getMetadata.mockResolvedValue(
+      createMediaItem({
+        id: 'plex-42',
+        type: 'movie',
+        year: 2099,
+        title: 'Fixture Action',
+        providerIds: { tmdb: ['111'], imdb: [], tvdb: [] },
+      }),
+    );
+    const { service } = createService({
+      mediaServer,
+      tmdbDetails: {
+        title: 'Fixture Action',
+        year: 2099,
+        type: 'movie',
+        externalIds: { tmdb: 222, type: 'movie' },
+      },
+    });
+
+    const candidates = await service.resolveLookupCandidatesForService(
+      'plex-42',
+      'radarr',
+    );
+
+    expect(candidates).toEqual([
+      { providerKey: 'tmdb', id: 111 },
+      { providerKey: 'tmdb', id: 222 },
+    ]);
+  });
+
+  it('uses a WeakMap so alternates cannot be retained beyond the ids object lifetime', () => {
+    // Pins the data-structure choice to prevent a future refactor from
+    // accidentally switching to a string-keyed Map (unbounded leak).
+    const { service } = createService({});
+    expect(
+      (service as unknown as { alternatesByIds: unknown }).alternatesByIds,
+    ).toBeInstanceOf(WeakMap);
+  });
+
+  it('produces stable alternates across two resolveLookupCandidates calls on the same media item', async () => {
+    const libraryItem = createMediaItem({
+      id: 'movie-stable',
+      type: 'movie',
+      year: 2099,
+      title: 'Fixture Stable',
+      providerIds: { tmdb: ['111'], imdb: [], tvdb: [] },
+    });
+    const { service } = createService({
+      tmdbDetails: {
+        title: 'Fixture Stable',
+        year: 2099,
+        type: 'movie',
+        externalIds: { tmdb: 222, type: 'movie' },
+      },
+    });
+
+    const first = await service.resolveLookupCandidatesFromMediaItem(
+      libraryItem,
+      { providerKeys: ['tmdb'] },
+    );
+    const second = await service.resolveLookupCandidatesFromMediaItem(
+      libraryItem,
+      { providerKeys: ['tmdb'] },
+    );
+
+    expect(first).toEqual(second);
+    expect(second).toEqual([
+      { providerKey: 'tmdb', id: 111 },
+      { providerKey: 'tmdb', id: 222 },
+    ]);
   });
 
   // Second-opinion path: the media item exposes only TMDB + IMDB tags.
@@ -932,6 +1144,38 @@ describe('MetadataService', () => {
       );
 
       expect(merged).toBeUndefined();
+    });
+
+    it("records cross-reference alternates against the caller's ids object", async () => {
+      // applyIdCorrections is called from THREE sites; the other tests cover
+      // validateDirectIds. This one covers the getDetails(merge:true) path:
+      // applyIdCorrections runs once with the primary provider's externalIds
+      // after the merge. Alternates must land on the same ids object
+      // reference the caller passed.
+      //
+      // Default preference is TVDB_PRIMARY; for the merge path to take TMDB
+      // as primary we make TVDB return undefined so the loop falls through.
+      const { service, tmdbProvider, tvdbProvider } = createService({});
+      tvdbProvider.getDetails.mockResolvedValue(undefined);
+      tmdbProvider.getDetails.mockResolvedValue({
+        id: 2,
+        title: 'Sample Series',
+        type: 'tv',
+        // TMDB reports a different tmdb (canonical cross-reference).
+        externalIds: { type: 'tv', tmdb: 999 },
+        ended: true,
+      });
+
+      const ids = { type: 'tv', tmdb: 2 } as const;
+      await service.getDetails(ids, 'tv', { merge: true });
+
+      // Direct verification: alternate is keyed by the caller's ids object.
+      const alternates = (
+        service as unknown as {
+          alternatesByIds: WeakMap<object, { tmdb?: number }>;
+        }
+      ).alternatesByIds.get(ids);
+      expect(alternates?.tmdb).toBe(999);
     });
   });
 });

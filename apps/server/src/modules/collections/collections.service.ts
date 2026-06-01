@@ -1204,6 +1204,10 @@ export class CollectionsService {
       ? await this.metadataService.getDetails(resolvedIds, resolvedIds.type)
       : undefined;
 
+    // resolvedIds.tmdb / .tvdb hold the media-server primary id; any
+    // cross-reference canonical lives in the alternates side-channel and is
+    // intentionally not surfaced here (preview artwork should match what the
+    // media server stores). #3010.
     return {
       tmdbId:
         (resolvedIds?.tmdb as number | undefined) ??

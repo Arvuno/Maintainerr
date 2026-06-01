@@ -29,9 +29,9 @@ describe('SeerrGetterService', () => {
     } as unknown as jest.Mocked<MediaServerFactory>;
 
     const metadataService = {
-      resolveIdsFromMediaItemForService: jest
+      resolveLookupCandidatesFromMediaItemForService: jest
         .fn()
-        .mockResolvedValue({ tmdb: 12345, type: 'movie' }),
+        .mockResolvedValue([{ providerKey: 'tmdb', id: 12345 }]),
     } as unknown as jest.Mocked<MetadataService>;
 
     const logger = createMockLogger();

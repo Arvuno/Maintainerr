@@ -104,4 +104,67 @@ describe('findMetadataLookupMatch', () => {
     });
     expect(result).toBeUndefined();
   });
+
+  // The Sonarr/Radarr getters and #3010 alternate fallback depend on the
+  // three-state contract: undefined skips, null is a confirmed miss (kept as
+  // a fallback so the caller's fail-closed vs not-tracked distinction is
+  // preserved), and a real value wins immediately if seen.
+  it('advances past a null primary and surfaces a later hit (alternate fallback)', async () => {
+    const candidates: MetadataLookupCandidate[] = [
+      { providerKey: 'tvdb', id: 280331 },
+      { providerKey: 'tvdb', id: 306261 },
+    ];
+    const result = await findMetadataLookupMatch<{ tvdbId: number } | null>(
+      candidates,
+      {
+        tvdb: async (id) => (id === 280331 ? null : { tvdbId: id }),
+      },
+    );
+    expect(result).toEqual({
+      candidate: { providerKey: 'tvdb', id: 306261 },
+      result: { tvdbId: 306261 },
+    });
+  });
+
+  it('returns the first remembered null when no later candidate hits', async () => {
+    const candidates: MetadataLookupCandidate[] = [
+      { providerKey: 'tvdb', id: 1 },
+      { providerKey: 'tvdb', id: 2 },
+    ];
+    const result = await findMetadataLookupMatch<{ tvdbId: number } | null>(
+      candidates,
+      { tvdb: async () => null },
+    );
+    expect(result).toEqual({
+      candidate: { providerKey: 'tvdb', id: 1 },
+      result: null,
+    });
+  });
+
+  it('returns undefined when all candidates fail (no null seen)', async () => {
+    const candidates: MetadataLookupCandidate[] = [
+      { providerKey: 'tvdb', id: 1 },
+      { providerKey: 'tvdb', id: 2 },
+    ];
+    const result = await findMetadataLookupMatch<{ tvdbId: number } | null>(
+      candidates,
+      { tvdb: async () => undefined },
+    );
+    expect(result).toBeUndefined();
+  });
+
+  it('prefers an explicit null over later undefineds for the caller-facing remembered miss', async () => {
+    const candidates: MetadataLookupCandidate[] = [
+      { providerKey: 'tvdb', id: 1 },
+      { providerKey: 'tvdb', id: 2 },
+    ];
+    const result = await findMetadataLookupMatch<{ tvdbId: number } | null>(
+      candidates,
+      { tvdb: async (id) => (id === 1 ? null : undefined) },
+    );
+    expect(result).toEqual({
+      candidate: { providerKey: 'tvdb', id: 1 },
+      result: null,
+    });
+  });
 });

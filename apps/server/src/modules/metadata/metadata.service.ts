@@ -29,6 +29,27 @@ export class MetadataService {
   private preference: MetadataProviderPreference =
     MetadataProviderPreference.TMDB_PRIMARY;
 
+  // Side channel: applyIdCorrections records cross-reference alternates
+  // here, keyed by the ResolvedMediaIds object it was given. The candidate
+  // builders read it so downstream lookups can try the primary id first and
+  // fall back to the cross-referenced id (see applyIdCorrections / #3010).
+  //
+  // Lifetime: scoped to a single `resolveIds*` invocation. Every resolve call
+  // allocates a fresh ids object via `extractDirectIds(item)`; the WeakMap
+  // key is that exact object, so alternates die with it (GC, no cleanup).
+  // Callers must therefore look up alternates from the SAME ids object the
+  // resolve returned — caching an ids object across calls then expecting to
+  // read alternates from a later call's WeakMap entry will not work.
+  //
+  // Per-provider, only one alternate per resolve is tracked (last write wins
+  // if the same ids object receives multiple disagreements for the same
+  // provider — fine for the current 2-provider setup). MUST stay a WeakMap;
+  // a string-keyed Map would leak unboundedly.
+  private readonly alternatesByIds = new WeakMap<
+    object,
+    Partial<ProviderIds>
+  >();
+
   constructor(
     @Inject(MetadataProviders)
     private readonly providers: IMetadataProvider[],
@@ -128,30 +149,35 @@ export class MetadataService {
     ids: Partial<ProviderIds>,
     candidateKeys: string[],
     allowedProviderKeys?: Set<string>,
+    alternates?: Partial<ProviderIds>,
   ): MetadataLookupCandidate[] {
-    const seen = new Set<string>();
+    const seenKeys = new Set<string>();
+    const emitted = new Set<string>();
     const lookupCandidates: MetadataLookupCandidate[] = [];
 
+    const tryEmit = (providerKey: string, raw: unknown) => {
+      if (typeof raw !== 'number' || !Number.isFinite(raw)) return;
+      const tag = `${providerKey}:${raw}`;
+      if (emitted.has(tag)) return;
+      emitted.add(tag);
+      lookupCandidates.push({ providerKey, id: raw });
+    };
+
     for (const providerKey of candidateKeys) {
-      if (seen.has(providerKey)) {
+      if (seenKeys.has(providerKey)) {
         continue;
       }
 
-      seen.add(providerKey);
+      seenKeys.add(providerKey);
 
       if (allowedProviderKeys && !allowedProviderKeys.has(providerKey)) {
         continue;
       }
 
-      const id = ids[providerKey];
-      if (typeof id !== 'number' || !Number.isFinite(id)) {
-        continue;
-      }
-
-      lookupCandidates.push({
-        providerKey,
-        id,
-      });
+      // Primary (media-server id) first, then any cross-reference alternate
+      // — see applyIdCorrections / #3010.
+      tryEmit(providerKey, ids[providerKey]);
+      if (alternates) tryEmit(providerKey, alternates[providerKey]);
     }
 
     return lookupCandidates;
@@ -160,6 +186,7 @@ export class MetadataService {
   private buildLookupCandidatesWithPolicy(
     ids: Partial<ProviderIds>,
     lookupPolicy: MetadataLookupPolicy = {},
+    alternates?: Partial<ProviderIds>,
   ): MetadataLookupCandidate[] {
     const { providerKeys, hasExplicitRestriction } =
       this.resolveLookupPolicyProviderKeys(lookupPolicy);
@@ -171,6 +198,7 @@ export class MetadataService {
       ids,
       [...providerKeys, ...Object.keys(ids)],
       allowedProviderKeys,
+      alternates,
     );
   }
 
@@ -190,6 +218,7 @@ export class MetadataService {
         ...resolvedIds,
       },
       lookupPolicy,
+      resolvedIds ? this.alternatesByIds.get(resolvedIds) : undefined,
     );
   }
 
@@ -209,6 +238,7 @@ export class MetadataService {
         ...resolvedIds,
       },
       lookupPolicy,
+      resolvedIds ? this.alternatesByIds.get(resolvedIds) : undefined,
     );
   }
 
@@ -581,6 +611,13 @@ export class MetadataService {
     return merged;
   }
 
+  // Record a cross-reference disagreement without overwriting the media
+  // server's id. The canonical id from the cross-referencing provider becomes
+  // an alternate (tracked in alternatesByIds) that downstream lookups try
+  // after the primary — so if the media server's id is right (e.g. #3010,
+  // where TMDB's external_ids pointed at a non-existent TVDB entry) we don't
+  // drop it, and if it's stale (provider merge/redirect) the alternate still
+  // resolves on the next attempt.
   private applyIdCorrections(
     ids: ProviderIds,
     externalIds: ProviderIds,
@@ -599,11 +636,24 @@ export class MetadataService {
         continue;
       }
 
+      // applyIdCorrections may run multiple times against the same `ids` (e.g.
+      // validateDirectIds, then getDetails downstream). Skip the warn + write
+      // when the alternate slot already records this exact disagreement.
+      let alternates = this.alternatesByIds.get(ids);
+      if (alternates && provider.extractId(alternates) === correctId) {
+        continue;
+      }
+
       const target = itemTitle ? ` for "${itemTitle}"` : '';
       this.logger.warn(
-        `Corrected ${provider.name} ID${target}: ${currentId} to ${correctId} via ${sourceProviderName} cross-reference. The media server may have incorrect metadata for this item.`,
+        `${sourceProviderName} cross-reference reports ${provider.name} ID${target} as ${correctId}, but the media server has ${currentId}. Keeping ${currentId} and trying ${correctId} as a fallback for downstream lookups.`,
       );
-      provider.assignId(ids, correctId);
+
+      if (!alternates) {
+        alternates = {};
+        this.alternatesByIds.set(ids, alternates);
+      }
+      provider.assignId(alternates, correctId);
     }
   }
 
@@ -680,7 +730,12 @@ export class MetadataService {
       }
 
       const showIds = this.extractDirectIds(show);
-      // Merge show-level IDs over the original, keeping 'type' from original
+      // Merge show-level IDs over the original, keeping 'type' from original.
+      // Note: this builds a fresh object, so any cross-reference alternates
+      // recorded against the input ids in alternatesByIds do NOT travel to
+      // image lookups — image lookups only see the (merged) media-server
+      // primary. This is intentional: getPosterUrl iterates providers via
+      // withProviderFallback, which handles the no-match case naturally.
       const merged: ProviderIds = { ...ids };
       for (const [key, value] of Object.entries(showIds)) {
         if (key !== 'type' && value !== undefined) {

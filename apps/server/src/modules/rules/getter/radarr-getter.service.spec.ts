@@ -283,6 +283,57 @@ describe('RadarrGetterService', () => {
     });
   });
 
+  describe('cross-reference alternate fallback (#3010)', () => {
+    let collectionMedia: CollectionMedia;
+    let mediaItem: MediaItem;
+
+    beforeEach(() => {
+      collectionMedia = createCollectionMedia('movie');
+      collectionMedia.collection.radarrSettingsId = 1;
+      mediaItem = createMediaItem({ type: 'movie' });
+    });
+
+    it('tries the primary tmdb first; falls back to the alternate when the primary is not in Radarr', async () => {
+      metadataService.resolveLookupCandidatesFromMediaItemForService.mockResolvedValue(
+        [
+          { providerKey: 'tmdb', id: 280331 },
+          { providerKey: 'tmdb', id: 306261 },
+        ],
+      );
+
+      const altMovie = createRadarrMovie({
+        movieFile: createRadarrMovieFile({ qualityCutoffNotMet: false }),
+      });
+      const mockedRadarrApi = new RadarrApi(
+        { url: 'http://localhost:7878', apiKey: 'test' },
+        logger as any,
+      );
+      // Radarr collapses both "not in Radarr" and "transport error" to
+      // undefined, so findMetadataLookupMatch will advance.
+      jest
+        .spyOn(mockedRadarrApi, 'getMovieByTmdbId')
+        .mockImplementation(async (id: number) =>
+          id === 306261 ? altMovie : (undefined as unknown as RadarrMovie),
+        );
+      servarrService.getRadarrApiClient.mockResolvedValue(mockedRadarrApi);
+
+      const response = await radarrGetterService.get(
+        20,
+        mediaItem,
+        createRulesDto({
+          collection: collectionMedia.collection,
+          dataType: 'movie',
+        }),
+      );
+
+      // The cut-off-met value came from the ALTERNATE movie, proving the
+      // candidate iteration tried it after the primary returned undefined.
+      expect(response).toBe(true);
+      expect(mockedRadarrApi.getMovieByTmdbId).toHaveBeenCalledWith(280331);
+      expect(mockedRadarrApi.getMovieByTmdbId).toHaveBeenCalledWith(306261);
+    });
+  });
+
   const mockRadarrApi = (movie?: RadarrMovie) => {
     const mockedRadarrApi = new RadarrApi(
       { url: 'http://localhost:7878', apiKey: 'test' },

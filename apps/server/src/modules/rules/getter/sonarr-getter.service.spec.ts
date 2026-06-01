@@ -992,6 +992,50 @@ describe('SonarrGetterService', () => {
     });
   });
 
+  describe('cross-reference alternate fallback (#3010)', () => {
+    let collectionMedia: CollectionMedia;
+    let mediaItem: MediaItem;
+
+    beforeEach(() => {
+      collectionMedia = createCollectionMedia('show');
+      collectionMedia.collection.sonarrSettingsId = 1;
+      mediaItem = createMediaItem({ type: 'show' });
+    });
+
+    it('tries the primary tvdb first; falls back to the alternate when the primary returns null (Sonarr confirmed-not-tracked)', async () => {
+      metadataService.resolveLookupCandidatesFromMediaItemForService.mockResolvedValue(
+        [
+          { providerKey: 'tvdb', id: 280331 },
+          { providerKey: 'tvdb', id: 306261 },
+        ] as any,
+      );
+
+      const altSeries = createSonarrSeries({ id: 42 });
+      const mockedSonarrApi = mockSonarrApi();
+      // Primary returns null (not in Sonarr) — must NOT short-circuit.
+      // Alternate returns a real series.
+      jest
+        .spyOn(mockedSonarrApi, 'getSeriesByTvdbId')
+        .mockImplementation(async (id: number) =>
+          id === 306261 ? altSeries : (null as any),
+        );
+
+      const response = await sonarrGetterService.get(
+        14, // any sonarr property that reads from the series
+        mediaItem,
+        'show',
+        createRulesDto({
+          collection: collectionMedia.collection,
+          dataType: 'show',
+        }),
+      );
+
+      expect(mockedSonarrApi.getSeriesByTvdbId).toHaveBeenCalledWith(280331);
+      expect(mockedSonarrApi.getSeriesByTvdbId).toHaveBeenCalledWith(306261);
+      expect(response).toBeDefined();
+    });
+  });
+
   const mockSonarrApi = (series?: SonarrSeries) => {
     const mockedSonarrApi = new SonarrApi(
       { url: 'http://localhost:8989', apiKey: 'test' },

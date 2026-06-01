@@ -41,7 +41,7 @@ describe('CollectionHandler', () => {
     settings = unitRef.get(SettingsDataService);
     metadataService = unitRef.get(MetadataService);
 
-    metadataService.resolveIdsForService.mockResolvedValue(undefined);
+    metadataService.resolveLookupCandidatesForService.mockResolvedValue([]);
 
     // Setup media server mock
     mediaServer = {

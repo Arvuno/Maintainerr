@@ -71,6 +71,9 @@ export class TmdbMetadataProvider implements IMetadataProvider {
       posterUrl: this.buildImageUrl(record.poster_path, 'w500'),
       backdropUrl: this.buildImageUrl(record.backdrop_path, 'w1280'),
       rating: record.vote_average || undefined,
+      // TMDB's external_ids.tvdb_id is only ever populated for TV records;
+      // movie endpoints omit it. Optional chaining keeps the movie path from
+      // emitting a bogus TVDB alternate via applyIdCorrections.
       externalIds: {
         tmdb: record.id,
         tvdb: record.external_ids?.tvdb_id ?? undefined,

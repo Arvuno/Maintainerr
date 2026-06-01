@@ -56,35 +56,53 @@ export class SeerrGetterService {
       }
 
       const prop = this.appProperties.find((el) => el.id === id);
-      const resolvedIds =
-        await this.metadataService.resolveIdsFromMediaItemForService(
+      // Try the media-server primary tmdb first, then any cross-reference
+      // alternate the metadata layer surfaced (e.g. a stale-id redirect via
+      // TMDB external_ids — see metadata.service.ts applyIdCorrections /
+      // #2643). #3010 keeps the primary authoritative; alternates only get
+      // a turn if the primary genuinely doesn't resolve at Seerr.
+      const lookupCandidates =
+        await this.metadataService.resolveLookupCandidatesFromMediaItemForService(
           libItem,
           'seerr',
         );
-      const tmdbId = resolvedIds?.tmdb as number | undefined;
+      const tmdbCandidates = lookupCandidates
+        .filter((c) => c.providerKey === 'tmdb')
+        .map((c) => c.id);
+      let resolvedTmdbId: number | undefined;
 
-      if (tmdbId) {
+      for (const tmdbId of tmdbCandidates) {
         if (libItem.type === 'movie') {
           movieMediaResponse = await this.seerrApi.getMovie(tmdbId.toString());
+          if (movieMediaResponse) {
+            resolvedTmdbId = tmdbId;
+            break;
+          }
         } else {
           tvMediaResponse = await this.seerrApi.getShow(tmdbId.toString());
-          if (dataType === 'season' || dataType === 'episode') {
-            const seasonNumber =
-              dataType === 'season'
-                ? origLibItem.index
-                : origLibItem.parentIndex;
-            seasonMediaResponse = await this.seerrApi.getSeason(
-              tmdbId.toString(),
-              seasonNumber?.toString(),
-            );
-            if (!seasonMediaResponse) {
-              this.logger.debug(
-                `Couldn't fetch season data for '${libItem.title}' season ${seasonNumber} from Seerr. As a result, unreliable results are expected.`,
+          if (tvMediaResponse) {
+            resolvedTmdbId = tmdbId;
+            if (dataType === 'season' || dataType === 'episode') {
+              const seasonNumber =
+                dataType === 'season'
+                  ? origLibItem.index
+                  : origLibItem.parentIndex;
+              seasonMediaResponse = await this.seerrApi.getSeason(
+                tmdbId.toString(),
+                seasonNumber?.toString(),
               );
+              if (!seasonMediaResponse) {
+                this.logger.debug(
+                  `Couldn't fetch season data for '${libItem.title}' season ${seasonNumber} from Seerr. As a result, unreliable results are expected.`,
+                );
+              }
             }
+            break;
           }
         }
-      } else {
+      }
+
+      if (resolvedTmdbId === undefined && tmdbCandidates.length === 0) {
         this.logger.debug(
           `Couldn't find tmdb id for media '${libItem.title}' with id '${libItem.id}'. As a result, no Seerr query could be made.`,
         );

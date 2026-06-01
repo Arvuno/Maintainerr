@@ -114,11 +114,21 @@ export class CollectionHandler {
     ) {
       // Seerr, if forced. Otherwise rely on media sync
       if (this.settings.seerrConfigured() && collection.forceSeerr) {
-        const ids = await this.metadataService.resolveIdsForService(
-          media.mediaServerId,
-          'seerr',
-        );
-        const tmdbId = (ids?.tmdb as number | undefined) ?? media.tmdbId;
+        // Primary tmdb first, then any cross-reference alternate the metadata
+        // layer surfaced (see applyIdCorrections / #3010). The stored
+        // `media.tmdbId` from earlier sync is the final fallback.
+        const lookupCandidates =
+          await this.metadataService.resolveLookupCandidatesForService(
+            media.mediaServerId,
+            'seerr',
+          );
+        const tmdbCandidates = lookupCandidates
+          .filter((c) => c.providerKey === 'tmdb')
+          .map((c) => c.id);
+        if (tmdbCandidates.length === 0 && media.tmdbId) {
+          tmdbCandidates.push(media.tmdbId);
+        }
+        const tmdbId = tmdbCandidates[0];
 
         if (!tmdbId) {
           this.logger.warn(
